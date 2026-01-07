@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         中科大教学质量评价自动填写
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  自动填写中科大教学质量管理平台评教问卷
-// @author       Your Name
+// @author       jiang068
 // @match        https://tqm.ustc.edu.cn/index.html*
 // @grant        none
 // ==/UserScript==
@@ -21,10 +21,10 @@
         // worst: 全选最差选项
         // normal: 全选一般选项
         // random: 随机选择
-        fillMode: 'random',
+        fillMode: 'best',
         
         // 每次切换问卷后是否随机切换模式
-        randomMode: true,
+        randomMode: false,
         
         // 文本题答案库(随机选择一个)
         textAnswerPool: [
