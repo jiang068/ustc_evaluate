@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         中科大教学质量评价自动填写
 // @namespace    http://tampermonkey.net/
-// @version      1.3b
+// @version      1.4
 // @description  自动填写中科大教学质量管理平台评教问卷，支持新版单选、多选、文本题
 // @author       Your Name
 // @match        https://tqm.ustc.edu.cn/index.html*
@@ -54,6 +54,7 @@
         submitContext: '.index__submitContext--xZR4w',
         tab: '.ant-tabs-tab',
         modalButton: '.ant-modal-content button',
+        message: '.ant-message',
         antButton: 'button.ant-btn'
     };
 
@@ -209,6 +210,24 @@
                 ? { choiceCount, textCount }
                 : null;
         }, timeout, '等待问卷内容加载超时');
+    }
+
+    function isLastQuestionnaireMessageVisible() {
+        return Array.from(document.querySelectorAll(SELECTORS.message))
+            .some(message => message.textContent.includes('当前已是最后一份问卷'));
+    }
+
+    async function waitForLastQuestionnaireMessage(timeout = 1200) {
+        try {
+            await waitForCondition(
+                () => isLastQuestionnaireMessageVisible(),
+                timeout,
+                '未检测到最后一份问卷提示'
+            );
+            return true;
+        } catch (error) {
+            return false;
+        }
     }
 
     async function clickChoiceInput(input) {
@@ -380,6 +399,12 @@
 
                 await sleep(500);
 
+                if (isLastQuestionnaireMessageVisible() || await waitForLastQuestionnaireMessage()) {
+                    currentTeacher++;
+                    console.log('✅ 当前已是最后一份问卷，任务完成');
+                    return 'completed';
+                }
+
                 const nextTeacherButton = Array.from(document.querySelectorAll(SELECTORS.modalButton))
                     .find(btn => btn.textContent.includes('下一位教师'));
 
@@ -417,6 +442,11 @@
 
         try {
             await sleep(500);
+            if (isLastQuestionnaireMessageVisible()) {
+                console.log('✅ 检测到最后一份问卷提示，不再查找下一课程');
+                return false;
+            }
+
             const nextButton = Array.from(document.querySelectorAll(SELECTORS.antButton))
                 .find(btn => btn.textContent.includes('下一课程'));
 
@@ -477,6 +507,7 @@
 
             const submitted = await submitQuestionnaire();
             if (!submitted) return false;
+            if (submitted === 'completed') return 'completed';
 
             await sleep(100);
         }
@@ -494,6 +525,10 @@
         while (hasMore && !isPaused) {
             const success = await processSingleQuestionnaire();
             if (!success) break;
+            if (success === 'completed') {
+                updateButton('✅ 全部完成', '#52c41a', true);
+                break;
+            }
 
             hasMore = await clickNextCourse();
             if (!hasMore) {
