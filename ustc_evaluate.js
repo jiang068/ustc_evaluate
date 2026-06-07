@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         中科大教学质量评价自动填写
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.3b
 // @description  自动填写中科大教学质量管理平台评教问卷，支持新版单选、多选、文本题
 // @author       Your Name
 // @match        https://tqm.ustc.edu.cn/index.html*
@@ -26,8 +26,11 @@
         // 【关键修复】默认关闭，避免覆盖用户的下拉框选择
         randomMode: false,
 
-        // 文本评价开关：开启才自动填写预设文本，关闭则保持文本题为空
-        enableTextEvaluation: false,
+        // 文本评价模式: 'none' | 'random' | 'skip'
+        // none: 全部填写“无”
+        // random: 从语料库中随机选择
+        // skip: 全部跳过，不修改文本题
+        textEvaluationMode: 'skip',
 
         // 文本题答案库(随机选择一个)
         textAnswerPool: [
@@ -89,6 +92,31 @@
         });
     }
 
+    function waitForCondition(checkFn, timeout = 8000, errorMessage = '等待条件超时') {
+        return new Promise((resolve, reject) => {
+            const check = () => {
+                const result = checkFn();
+                if (result) {
+                    clearTimeout(timer);
+                    observer.disconnect();
+                    resolve(result);
+                }
+            };
+
+            const observer = new MutationObserver(check);
+            const timer = setTimeout(() => {
+                observer.disconnect();
+                reject(new Error(errorMessage));
+            }, timeout);
+
+            observer.observe(document.body || document.documentElement, {
+                childList: true,
+                subtree: true
+            });
+            check();
+        });
+    }
+
     function randomDelay(min = 30, max = 120) {
         const delay = Math.floor(Math.random() * (max - min + 1)) + min;
         return sleep(delay);
@@ -129,8 +157,86 @@
     }
 
     function dispatchTextareaEvents(textarea) {
-        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        const inputEvent = typeof InputEvent === 'function'
+            ? new InputEvent('input', {
+                bubbles: true,
+                inputType: 'insertText',
+                data: textarea.value
+            })
+            : new Event('input', { bubbles: true });
+
+        textarea.dispatchEvent(inputEvent);
         textarea.dispatchEvent(new Event('change', { bubbles: true }));
+        textarea.dispatchEvent(new Event('blur', { bubbles: true }));
+    }
+
+    function setNativeValue(element, value) {
+        const valueSetter = Object.getOwnPropertyDescriptor(element, 'value')?.set;
+        const prototype = Object.getPrototypeOf(element);
+        const prototypeValueSetter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+
+        if (prototypeValueSetter && valueSetter !== prototypeValueSetter) {
+            prototypeValueSetter.call(element, value);
+        } else if (valueSetter) {
+            valueSetter.call(element, value);
+        } else {
+            element.value = value;
+        }
+    }
+
+    function setNativeChecked(element, checked) {
+        const checkedSetter = Object.getOwnPropertyDescriptor(element, 'checked')?.set;
+        const prototype = Object.getPrototypeOf(element);
+        const prototypeCheckedSetter = Object.getOwnPropertyDescriptor(prototype, 'checked')?.set;
+
+        if (prototypeCheckedSetter && checkedSetter !== prototypeCheckedSetter) {
+            prototypeCheckedSetter.call(element, checked);
+        } else if (checkedSetter) {
+            checkedSetter.call(element, checked);
+        } else {
+            element.checked = checked;
+        }
+    }
+
+    async function waitForQuestionnaireContent(timeout = 8000) {
+        return waitForCondition(() => {
+            const answerRoot = document.querySelector(SELECTORS.answerRoot);
+            const submitButton = document.querySelector(SELECTORS.submitButton);
+            const choiceCount = document.querySelectorAll(SELECTORS.choiceGroup).length;
+            const textCount = document.querySelectorAll(SELECTORS.textArea).length;
+
+            return answerRoot && submitButton && (choiceCount > 0 || textCount > 0)
+                ? { choiceCount, textCount }
+                : null;
+        }, timeout, '等待问卷内容加载超时');
+    }
+
+    async function clickChoiceInput(input) {
+        if (!input || input.disabled) return false;
+
+        const label = input.closest('label');
+        const isRadio = input.type === 'radio';
+        const wasChecked = input.checked;
+
+        if (label) {
+            label.click();
+        } else {
+            input.click();
+        }
+
+        await sleep(40);
+
+        if (isRadio ? input.checked : input.checked !== wasChecked) {
+            return true;
+        }
+
+        setNativeChecked(input, true);
+        input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(20);
+
+        return input.checked || Boolean(label?.classList.contains('ant-radio-wrapper-checked'));
     }
 
     async function fillChoiceQuestions() {
@@ -140,7 +246,16 @@
         const currentMode = CONFIG.randomMode ? getRandomMode() : CONFIG.fillMode;
         console.log(`当前填写模式: ${currentMode}`);
 
-        const choiceGroups = document.querySelectorAll(SELECTORS.choiceGroup);
+        let choiceGroups = document.querySelectorAll(SELECTORS.choiceGroup);
+        if (choiceGroups.length === 0) {
+            try {
+                await waitForQuestionnaireContent();
+                choiceGroups = document.querySelectorAll(SELECTORS.choiceGroup);
+            } catch (error) {
+                console.error('✗ 未等到选择题加载，停止本份问卷:', error);
+                return false;
+            }
+        }
         console.log(`找到 ${choiceGroups.length} 道选择题`);
 
         for (let i = 0; i < choiceGroups.length; i++) {
@@ -160,8 +275,12 @@
                     const answerValue = getAnswerByMode(currentMode, radios.length);
                     if (answerValue <= radios.length) {
                         const targetRadio = radios[answerValue - 1];
-                        if (!targetRadio.checked) targetRadio.click();
-                        console.log(`✓ 第${i + 1}题(单选)已选择: 选项${answerValue}/${radios.length}`);
+                        const selected = targetRadio.checked || await clickChoiceInput(targetRadio);
+                        if (selected) {
+                            console.log(`✓ 第${i + 1}题(单选)已选择: 选项${answerValue}/${radios.length}`);
+                        } else {
+                            console.warn(`⚠ 第${i + 1}题(单选)选项${answerValue}可能未选中`);
+                        }
                     }
                 } else if (checkboxes.length > 0) {
                     let targetIndices = [];
@@ -184,11 +303,11 @@
                             break;
                     }
 
-                    targetIndices.forEach(idx => {
+                    for (const idx of targetIndices) {
                         if (checkboxes[idx] && !checkboxes[idx].checked) {
-                            checkboxes[idx].click();
+                            await clickChoiceInput(checkboxes[idx]);
                         }
-                    });
+                    }
                     console.log(`✓ 第${i + 1}题(多选)已选择: ${targetIndices.length}个选项`);
                 } else {
                     console.warn(`⚠ 第${i + 1}题没有找到选项(可能不是选择题)`);
@@ -211,14 +330,8 @@
         try {
             const textareas = document.querySelectorAll(SELECTORS.textArea);
 
-            if (!CONFIG.enableTextEvaluation) {
-                textareas.forEach(textarea => {
-                    if (textarea.value) {
-                        textarea.value = '';
-                        dispatchTextareaEvents(textarea);
-                    }
-                });
-                console.log(`文本评价开关关闭，已保持 ${textareas.length} 个文本题为空`);
+            if (CONFIG.textEvaluationMode === 'skip') {
+                console.log(`文本评价全部跳过，未修改 ${textareas.length} 个文本题`);
                 return true;
             }
 
@@ -226,15 +339,15 @@
 
             if (textareas.length > 0) {
                 for(let i = 0; i < textareas.length; i++) {
-                    const randomAnswer = CONFIG.textAnswerPool[
-                        Math.floor(Math.random() * CONFIG.textAnswerPool.length)
-                    ];
+                    const answer = CONFIG.textEvaluationMode === 'none'
+                        ? '无'
+                        : CONFIG.textAnswerPool[Math.floor(Math.random() * CONFIG.textAnswerPool.length)];
 
                     const textarea = textareas[i];
-                    textarea.value = randomAnswer;
+                    setNativeValue(textarea, answer);
                     dispatchTextareaEvents(textarea);
 
-                    console.log(`✓ 第${i + 1}个文本题已填写: ${randomAnswer.substring(0, 15)}...`);
+                    console.log(`✓ 第${i + 1}个文本题已填写: ${answer.substring(0, 15)}...`);
                 }
             }
         } catch (error) {
@@ -321,7 +434,25 @@
     }
 
     async function processAllTabs() {
+        try {
+            const content = await waitForQuestionnaireContent();
+            console.log(`问卷内容已加载: ${content.choiceCount} 道选择题, ${content.textCount} 道文本题`);
+        } catch (error) {
+            console.error('✗ 问卷内容未加载完成，停止处理:', error);
+            return false;
+        }
+
         const tabs = document.querySelectorAll(SELECTORS.tab);
+        if (tabs.length === 0) {
+            const choiceSuccess = await fillChoiceQuestions();
+            if (!choiceSuccess) return false;
+
+            const textSuccess = await fillTextQuestions();
+            if (!textSuccess) return false;
+
+            return submitQuestionnaire();
+        }
+
         let startIndex = 0;
         for (let i = 0; i < tabs.length; i++) {
             if (tabs[i].classList.contains('ant-tabs-tab-active')) {
@@ -488,25 +619,26 @@
         randomModeDiv.appendChild(randomModeLabel);
         panel.appendChild(randomModeDiv);
 
-        const textEvalDiv = document.createElement('label');
-        textEvalDiv.style.cssText = `font-size: 12px; margin-bottom: 12px; display: flex; align-items: center; cursor: pointer; color: #666;`;
+        const textEvalLabel = document.createElement('div');
+        textEvalLabel.textContent = '文本评价:';
+        textEvalLabel.style.cssText = `font-size: 12px; color: #666; margin-bottom: 5px;`;
+        panel.appendChild(textEvalLabel);
 
-        const textEvalCheckbox = document.createElement('input');
-        textEvalCheckbox.type = 'checkbox';
-        textEvalCheckbox.checked = CONFIG.enableTextEvaluation;
-        textEvalCheckbox.style.cssText = `margin-right: 5px;`;
+        const textEvalSelect = document.createElement('select');
+        textEvalSelect.style.cssText = `width: 100%; padding: 6px; margin-bottom: 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 12px; cursor: pointer; color: #333;`;
+        textEvalSelect.innerHTML = `
+            <option value="skip">全部跳过</option>
+            <option value="none">全部填“无”</option>
+            <option value="random">语料库中随机</option>
+        `;
+        textEvalSelect.value = CONFIG.textEvaluationMode;
 
-        textEvalCheckbox.addEventListener('change', (e) => {
-            CONFIG.enableTextEvaluation = e.target.checked;
-            console.log('文本评价自动填写:', CONFIG.enableTextEvaluation);
+        textEvalSelect.addEventListener('change', (e) => {
+            CONFIG.textEvaluationMode = e.target.value;
+            console.log('文本评价模式:', CONFIG.textEvaluationMode);
         });
 
-        const textEvalLabel = document.createElement('span');
-        textEvalLabel.textContent = '文本评价';
-
-        textEvalDiv.appendChild(textEvalCheckbox);
-        textEvalDiv.appendChild(textEvalLabel);
-        panel.appendChild(textEvalDiv);
+        panel.appendChild(textEvalSelect);
 
         controlButton = document.createElement('button');
         controlButton.textContent = '▶️ 开始填写';
