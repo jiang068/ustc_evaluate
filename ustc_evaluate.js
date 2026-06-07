@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         中科大教学质量评价自动填写
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  自动填写中科大教学质量管理平台评教问卷，支持新版单选、多选、文本题
 // @author       Your Name
 // @match        https://tqm.ustc.edu.cn/index.html*
@@ -14,7 +14,7 @@
     // ==================== 配置区 ====================
     const CONFIG = {
         // 自动提交延迟(毫秒)
-        submitDelay: 500,
+        submitDelay: 300,
 
         // 填写模式: 'best' | 'worst' | 'normal' | 'random'
         // best: 全选最好选项(多选题选前两项)
@@ -25,6 +25,9 @@
 
         // 【关键修复】默认关闭，避免覆盖用户的下拉框选择
         randomMode: false,
+
+        // 文本评价开关：开启才自动填写预设文本，关闭则保持文本题为空
+        enableTextEvaluation: false,
 
         // 文本题答案库(随机选择一个)
         textAnswerPool: [
@@ -40,6 +43,17 @@
     let isPaused = false;
     let currentTeacher = 0; // 已处理的教师数量
 
+    const SELECTORS = {
+        answerRoot: '.index__answer--p1aNv',
+        choiceGroup: '.index__selectGroup--Z1yeL',
+        textArea: 'textarea.index__UEditoTextarea--yga85',
+        submitButton: 'button.index__submit--jiKIA',
+        submitContext: '.index__submitContext--xZR4w',
+        tab: '.ant-tabs-tab',
+        modalButton: '.ant-modal-content button',
+        antButton: 'button.ant-btn'
+    };
+
     // ==================== 工具函数 ====================
 
     function sleep(ms) {
@@ -48,21 +62,34 @@
 
     function waitForElement(selector, timeout = 5000) {
         return new Promise((resolve, reject) => {
-            const startTime = Date.now();
-            const timer = setInterval(() => {
-                const element = document.querySelector(selector);
-                if (element) {
-                    clearInterval(timer);
-                    resolve(element);
-                } else if (Date.now() - startTime > timeout) {
-                    clearInterval(timer);
-                    reject(new Error(`等待元素超时: ${selector}`));
+            const element = document.querySelector(selector);
+            if (element) {
+                resolve(element);
+                return;
+            }
+
+            const observer = new MutationObserver(() => {
+                const target = document.querySelector(selector);
+                if (target) {
+                    clearTimeout(timer);
+                    observer.disconnect();
+                    resolve(target);
                 }
-            }, 100);
+            });
+
+            const timer = setTimeout(() => {
+                observer.disconnect();
+                reject(new Error(`等待元素超时: ${selector}`));
+            }, timeout);
+
+            observer.observe(document.body || document.documentElement, {
+                childList: true,
+                subtree: true
+            });
         });
     }
 
-    function randomDelay(min = 50, max = 200) {
+    function randomDelay(min = 30, max = 120) {
         const delay = Math.floor(Math.random() * (max - min + 1)) + min;
         return sleep(delay);
     }
@@ -89,6 +116,23 @@
         return modes[Math.floor(Math.random() * modes.length)];
     }
 
+    function getRandomIndices(length, count) {
+        const indices = Array.from({ length }, (_, idx) => idx);
+        const limit = Math.min(count, length);
+
+        for (let i = 0; i < limit; i++) {
+            const j = i + Math.floor(Math.random() * (length - i));
+            [indices[i], indices[j]] = [indices[j], indices[i]];
+        }
+
+        return indices.slice(0, limit);
+    }
+
+    function dispatchTextareaEvents(textarea) {
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        textarea.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
     async function fillChoiceQuestions() {
         console.log('开始填写选择题(单选/多选)...');
 
@@ -96,7 +140,7 @@
         const currentMode = CONFIG.randomMode ? getRandomMode() : CONFIG.fillMode;
         console.log(`当前填写模式: ${currentMode}`);
 
-        const choiceGroups = document.querySelectorAll('.index__selectGroup--Z1yeL');
+        const choiceGroups = document.querySelectorAll(SELECTORS.choiceGroup);
         console.log(`找到 ${choiceGroups.length} 道选择题`);
 
         for (let i = 0; i < choiceGroups.length; i++) {
@@ -106,7 +150,7 @@
             }
 
             try {
-                await randomDelay(100, 300);
+                await randomDelay();
 
                 const group = choiceGroups[i];
                 const radios = group.querySelectorAll('input[type="radio"]');
@@ -136,8 +180,7 @@
                         case 'random':
                         default:
                             const selectCount = Math.floor(Math.random() * maxSelect) + 1;
-                            const indices = Array.from({length: checkboxes.length}, (_, idx) => idx);
-                            targetIndices = indices.sort(() => 0.5 - Math.random()).slice(0, selectCount);
+                            targetIndices = getRandomIndices(checkboxes.length, selectCount);
                             break;
                     }
 
@@ -166,8 +209,20 @@
         if (isPaused) return false;
 
         try {
-            await randomDelay(200, 500);
-            const textareas = document.querySelectorAll('textarea.index__UEditoTextarea--yga85');
+            const textareas = document.querySelectorAll(SELECTORS.textArea);
+
+            if (!CONFIG.enableTextEvaluation) {
+                textareas.forEach(textarea => {
+                    if (textarea.value) {
+                        textarea.value = '';
+                        dispatchTextareaEvents(textarea);
+                    }
+                });
+                console.log(`文本评价开关关闭，已保持 ${textareas.length} 个文本题为空`);
+                return true;
+            }
+
+            await randomDelay();
 
             if (textareas.length > 0) {
                 for(let i = 0; i < textareas.length; i++) {
@@ -177,12 +232,7 @@
 
                     const textarea = textareas[i];
                     textarea.value = randomAnswer;
-
-                    const inputEvent = new Event('input', { bubbles: true });
-                    textarea.dispatchEvent(inputEvent);
-
-                    const changeEvent = new Event('change', { bubbles: true });
-                    textarea.dispatchEvent(changeEvent);
+                    dispatchTextareaEvents(textarea);
 
                     console.log(`✓ 第${i + 1}个文本题已填写: ${randomAnswer.substring(0, 15)}...`);
                 }
@@ -201,40 +251,40 @@
         try {
             await sleep(CONFIG.submitDelay);
 
-            let submitButton = document.querySelector('button.index__submit--jiKIA') ||
+            let submitButton = document.querySelector(SELECTORS.submitButton) ||
                                Array.from(document.querySelectorAll('button')).find(btn => btn.textContent.includes('提 交') || btn.textContent.includes('提交'));
 
             if (!submitButton) {
-                const submitContext = document.querySelector('.index__submitContext--xZR4w');
+                const submitContext = document.querySelector(SELECTORS.submitContext);
                 if (submitContext) submitButton = submitContext.querySelector('button');
             }
 
             if (submitButton) {
                 console.log('✓ 找到提交按钮,准备点击...');
-                await sleep(300);
+                await sleep(150);
                 submitButton.click();
                 console.log('✓ 问卷已提交!');
 
-                await sleep(800);
+                await sleep(500);
 
-                const nextTeacherButton = Array.from(document.querySelectorAll('.ant-modal-content button'))
+                const nextTeacherButton = Array.from(document.querySelectorAll(SELECTORS.modalButton))
                     .find(btn => btn.textContent.includes('下一位教师'));
 
                 if (nextTeacherButton) {
-                    await sleep(300);
+                    await sleep(150);
                     nextTeacherButton.click();
                     currentTeacher++;
                     console.log(`📊 已完成 ${currentTeacher} 位教师的评价`);
-                    await sleep(600);
+                    await sleep(350);
                 } else {
-                    const confirmButton = Array.from(document.querySelectorAll('.ant-modal-content button'))
+                    const confirmButton = Array.from(document.querySelectorAll(SELECTORS.modalButton))
                         .find(btn => btn.textContent.includes('确 定') || btn.textContent.includes('确定'));
                     if (confirmButton) {
-                        await sleep(300);
+                        await sleep(150);
                         confirmButton.click();
                         currentTeacher++;
                         console.log(`📊 已完成 ${currentTeacher} 位教师的评价`);
-                        await sleep(600);
+                        await sleep(350);
                     }
                 }
                 return true;
@@ -253,14 +303,14 @@
         if (isPaused) return false;
 
         try {
-            await sleep(800);
-            const nextButton = Array.from(document.querySelectorAll('button.ant-btn'))
+            await sleep(500);
+            const nextButton = Array.from(document.querySelectorAll(SELECTORS.antButton))
                 .find(btn => btn.textContent.includes('下一课程'));
 
             if (nextButton) {
-                await sleep(300);
+                await sleep(150);
                 nextButton.click();
-                await sleep(1000);
+                await sleep(650);
                 return true;
             } else {
                 return false;
@@ -271,7 +321,7 @@
     }
 
     async function processAllTabs() {
-        const tabs = document.querySelectorAll('.ant-tabs-tab');
+        const tabs = document.querySelectorAll(SELECTORS.tab);
         let startIndex = 0;
         for (let i = 0; i < tabs.length; i++) {
             if (tabs[i].classList.contains('ant-tabs-tab-active')) {
@@ -285,7 +335,7 @@
 
             if (i !== startIndex) {
                 tabs[i].click();
-                await sleep(500);
+                await sleep(300);
             }
 
             const choiceSuccess = await fillChoiceQuestions();
@@ -297,7 +347,7 @@
             const submitted = await submitQuestionnaire();
             if (!submitted) return false;
 
-            await sleep(200);
+            await sleep(100);
         }
         return true;
     }
@@ -359,7 +409,7 @@
         document.addEventListener('mouseup', dragEnd);
 
         function dragStart(e) {
-            if (e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+            if (e.target.closest('button, select, input, label')) return;
             initialX = e.clientX - xOffset;
             initialY = e.clientY - yOffset;
             isDragging = true;
@@ -438,6 +488,26 @@
         randomModeDiv.appendChild(randomModeLabel);
         panel.appendChild(randomModeDiv);
 
+        const textEvalDiv = document.createElement('label');
+        textEvalDiv.style.cssText = `font-size: 12px; margin-bottom: 12px; display: flex; align-items: center; cursor: pointer; color: #666;`;
+
+        const textEvalCheckbox = document.createElement('input');
+        textEvalCheckbox.type = 'checkbox';
+        textEvalCheckbox.checked = CONFIG.enableTextEvaluation;
+        textEvalCheckbox.style.cssText = `margin-right: 5px;`;
+
+        textEvalCheckbox.addEventListener('change', (e) => {
+            CONFIG.enableTextEvaluation = e.target.checked;
+            console.log('文本评价自动填写:', CONFIG.enableTextEvaluation);
+        });
+
+        const textEvalLabel = document.createElement('span');
+        textEvalLabel.textContent = '文本评价';
+
+        textEvalDiv.appendChild(textEvalCheckbox);
+        textEvalDiv.appendChild(textEvalLabel);
+        panel.appendChild(textEvalDiv);
+
         controlButton = document.createElement('button');
         controlButton.textContent = '▶️ 开始填写';
         controlButton.style.cssText = `width: 100%; padding: 10px; background: #1890ff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold; margin-bottom: 8px;`;
@@ -483,7 +553,7 @@
 
     async function main() {
         try {
-            await waitForElement('.index__answer--p1aNv');
+            await waitForElement(SELECTORS.answerRoot);
             addControlPanel();
         } catch (error) {
             console.error('初始化失败:', error);
