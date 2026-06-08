@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         中科大教学质量评价自动填写
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.4a
 // @description  自动填写中科大教学质量管理平台评教问卷，支持新版单选、多选、文本题
 // @author       Your Name
 // @match        https://tqm.ustc.edu.cn/index.html*
@@ -138,6 +138,59 @@
             default:
                 return 1;
         }
+    }
+
+    function normalizeText(text) {
+        return (text || '').replace(/\s+/g, '').trim();
+    }
+
+    function getChoiceLabelText(input) {
+        const label = input.closest('label');
+        if (label) return normalizeText(label.textContent);
+
+        const wrapper = input.closest('.ant-radio-wrapper, .ant-checkbox-wrapper');
+        if (wrapper) return normalizeText(wrapper.textContent);
+
+        return normalizeText(input.parentElement?.textContent);
+    }
+
+    function getQuestionText(group) {
+        const subjectItem = group.closest('.index__subjectItem--XWS1b');
+        if (subjectItem) return normalizeText(subjectItem.textContent);
+
+        const subject = group.closest('.index__subject--m07WV');
+        if (subject) return normalizeText(subject.textContent);
+
+        return normalizeText(group.textContent);
+    }
+
+    function hasOption(optionTexts, keyword) {
+        return optionTexts.some(text => text.includes(keyword));
+    }
+
+    function getRadioAnswerByQuestion(mode, group, radios) {
+        const defaultAnswer = getAnswerByMode(mode, radios.length);
+
+        if (mode !== 'best') return defaultAnswer;
+
+        const questionText = getQuestionText(group);
+        const optionTexts = Array.from(radios, getChoiceLabelText);
+        const isDifficultyQuestion = (questionText.includes('课程内容难度') || questionText.includes('课程难度'))
+            || (hasOption(optionTexts, '非常难')
+                && hasOption(optionTexts, '有点难')
+                && hasOption(optionTexts, '适合')
+                && hasOption(optionTexts, '有点简单')
+                && hasOption(optionTexts, '非常简单'));
+
+        if (isDifficultyQuestion) {
+            const suitableIndex = optionTexts.findIndex(text => text.includes('适合'));
+            if (suitableIndex !== -1) {
+                console.log(`✓ 识别为课程难度题，选择: ${optionTexts[suitableIndex]}`);
+                return suitableIndex + 1;
+            }
+        }
+
+        return defaultAnswer;
     }
 
     function getRandomMode() {
@@ -291,7 +344,7 @@
                 const checkboxes = group.querySelectorAll('input[type="checkbox"]');
 
                 if (radios.length > 0) {
-                    const answerValue = getAnswerByMode(currentMode, radios.length);
+                    const answerValue = getRadioAnswerByQuestion(currentMode, group, radios);
                     if (answerValue <= radios.length) {
                         const targetRadio = radios[answerValue - 1];
                         const selected = targetRadio.checked || await clickChoiceInput(targetRadio);
